@@ -87,6 +87,11 @@ jobs:
           cd apps/readest-app
           rm -rf src-tauri/gen/android
           pnpm tauri android init
+          # Official nightly regenerates app icons + adaptive-icon colors from
+          # the readest artwork (supplies @color/ic_launcher_background etc.
+          # that the tracked gen/android references), then restores the tracked
+          # overrides. Missing this step -> AAPT: color/ic_launcher_background not found.
+          pnpm tauri icon ../../data/icons/readest-book.png
           # The repo TRACKS its own customized gen/android: app/build.gradle.kts
           # already carries `missingDimensionStrategy("store", storeFlavor)`
           # (default foss, read via -PstoreFlavor). Official nightly restores it
