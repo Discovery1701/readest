@@ -96,12 +96,12 @@ jobs:
             -dname "CN=Readest, OU=Readest, O=Readest, L=NA, ST=NA, C=CN" >/dev/null 2>&1
           pushd src-tauri/gen/android
           cat > keystore.properties <<EOF
-keyAlias=readest
-password=readestpassword
-storePassword=readestpassword
-keyPassword=readestpassword
-storeFile=$RUNNER_TEMP/readest-keystore.jks
-EOF
+          keyAlias=readest
+          password=readestpassword
+          storePassword=readestpassword
+          keyPassword=readestpassword
+          storeFile=$RUNNER_TEMP/readest-keystore.jks
+          EOF
           popd
           # NOTE: do NOT `git checkout .` here — it reverts access.ts unlock.
           pnpm tauri android build
