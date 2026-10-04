@@ -1,0 +1,109 @@
+# Self-contained Android build for self-hosted / "own S3" use.
+# Derived from nightly.yml's android leg, but WITHOUT any repo-scoped secrets:
+#   - no official signing keystore  (builds a DEBUG-signed APK, installable)
+#   - no R2 upload / Sentry         (uses actions/upload-artifact instead)
+# IMPORTANT: nightly does `git checkout .` after `tauri android init`, which
+# would REVERT the CLOUD_SYNC unlock in access.ts — this workflow deliberately
+# does NOT do that, and verifies the unlock survived.
+name: Build Android unlocked
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 160
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # 不填 version，读根 package.json 的 packageManager (pnpm@11)
+
+      - name: setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: setup Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          # legacy `tools` package no longer exists in the SDK repo
+          packages: 'platform-tools'
+
+      - name: install NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: build-android-cargo
+
+      - name: create .env.local for build
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> apps/readest-app/.env.local
+
+      - name: verify unlock persists
+        shell: bash
+        run: |
+          grep -q "CLOUD_SYNC_REQUIRES_PREMIUM = false" apps/readest-app/src/utils/access.ts \
+            || { echo "::error::unlock was lost"; exit 1; }
+
+      - name: build debug Android apk (no repo secrets)
+        shell: bash
+        timeout-minutes: 140
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          cd apps/readest-app
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          # NOTE: do NOT `git checkout .` here — it reverts access.ts unlock.
+          pnpm tauri android build --debug
+
+      - name: collect apk
+        shell: bash
+        run: |
+          mkdir -p dist
+          apk=apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+          if [ ! -f "$apk" ]; then
+            echo "::error::apk not found at $apk"
+            find apps/readest-app/src-tauri -name '*.apk' 2>/dev/null | head -20
+            exit 1
+          fi
+          cp "$apk" dist/Readest_universal-debug.apk
+
+      - name: upload apk
+        uses: actions/upload-artifact@v4 # 官方 tag，避免 fork 上 SHA 不可解析
+        with:
+          name: readest-android-universal-debug
+          path: dist/
+          if-no-files-found: error
