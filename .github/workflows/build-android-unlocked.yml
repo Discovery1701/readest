@@ -87,6 +87,12 @@ jobs:
           cd apps/readest-app
           rm -rf src-tauri/gen/android
           pnpm tauri android init
+          # tauri-plugin-native-bridge defines foss/googleplay product flavors;
+          # pin the store dimension to `foss` so gradle can resolve mergeUniversalRelease*.
+          kts=src-tauri/gen/android/app/build.gradle.kts
+          sed -i 's/^\(\s*\)defaultConfig {/\1defaultConfig {\n\1    missingDimensionStrategy("store", "foss")/' "$kts"
+          grep -q 'missingDimensionStrategy("store", "foss")' "$kts" \
+            || { echo "::error::failed to inject store dimension strategy"; exit 1; }
           # Generate a throwaway signing keystore for the release APK and point
           # gradle at it. Provide every property key the Tauri template may read.
           keytool -genkeypair -v \
