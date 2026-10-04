@@ -82,7 +82,7 @@ jobs:
           cp target/${{ matrix.config.rust_target }}/release/bundle/nsis/*.exe dist/ || true
 
       - name: upload artifacts
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cdbbfb85f1c63 # v4.6.1
+        uses: actions/upload-artifact@v4 # 官方 tag，避免 fork 上 SHA 不可解析
         with:
           name: readest-windows-${{ matrix.config.arch }}
           path: dist/
