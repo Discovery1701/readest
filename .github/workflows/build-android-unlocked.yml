@@ -1,7 +1,8 @@
-# Self-contained Android build for self-hosted / "own S3" use.
+# Self-contained Android RELEASE build for self-hosted / "own S3" use.
 # Derived from nightly.yml's android leg, but WITHOUT any repo-scoped secrets:
-#   - no official signing keystore  (builds a DEBUG-signed APK, installable)
-#   - no R2 upload / Sentry         (uses actions/upload-artifact instead)
+#   - no official signing keystore: generates a fresh keystore in-CI with
+#     keytool and signs the release APK with it (installable on own devices)
+#   - no R2 upload / Sentry: uses actions/upload-artifact instead
 # IMPORTANT: nightly does `git checkout .` after `tauri android init`, which
 # would REVERT the CLOUD_SYNC unlock in access.ts — this workflow deliberately
 # does NOT do that, and verifies the unlock survived.
@@ -76,7 +77,7 @@ jobs:
           grep -q "CLOUD_SYNC_REQUIRES_PREMIUM = false" apps/readest-app/src/utils/access.ts \
             || { echo "::error::unlock was lost"; exit 1; }
 
-      - name: build debug Android apk (no repo secrets)
+      - name: build release Android apk (self-signed, no repo secrets)
         shell: bash
         timeout-minutes: 140
         env:
@@ -86,24 +87,40 @@ jobs:
           cd apps/readest-app
           rm -rf src-tauri/gen/android
           pnpm tauri android init
+          # Generate a throwaway signing keystore for the release APK and point
+          # gradle at it. Provide every property key the Tauri template may read.
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/readest-keystore.jks" \
+            -alias readest -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass readestpassword -keypass readestpassword \
+            -dname "CN=Readest, OU=Readest, O=Readest, L=NA, ST=NA, C=CN" >/dev/null 2>&1
+          pushd src-tauri/gen/android
+          cat > keystore.properties <<EOF
+keyAlias=readest
+password=readestpassword
+storePassword=readestpassword
+keyPassword=readestpassword
+storeFile=$RUNNER_TEMP/readest-keystore.jks
+EOF
+          popd
           # NOTE: do NOT `git checkout .` here — it reverts access.ts unlock.
-          pnpm tauri android build --debug
+          pnpm tauri android build
 
       - name: collect apk
         shell: bash
         run: |
           mkdir -p dist
-          apk=apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+          apk=apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
           if [ ! -f "$apk" ]; then
             echo "::error::apk not found at $apk"
             find apps/readest-app/src-tauri -name '*.apk' 2>/dev/null | head -20
             exit 1
           fi
-          cp "$apk" dist/Readest_universal-debug.apk
+          cp "$apk" dist/Readest_universal-release.apk
 
       - name: upload apk
         uses: actions/upload-artifact@v4 # 官方 tag，避免 fork 上 SHA 不可解析
         with:
-          name: readest-android-universal-debug
+          name: readest-android-universal-release
           path: dist/
           if-no-files-found: error
