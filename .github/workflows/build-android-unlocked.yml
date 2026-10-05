@@ -92,13 +92,14 @@ jobs:
           # that the tracked gen/android references), then restores the tracked
           # overrides. Missing this step -> AAPT: color/ic_launcher_background not found.
           pnpm tauri icon ../../data/icons/readest-book.png
-          # The repo TRACKS its own customized gen/android: app/build.gradle.kts
-          # already carries `missingDimensionStrategy("store", storeFlavor)`
-          # (default foss, read via -PstoreFlavor). Official nightly restores it
-          # with a whole-repo `git checkout .`. We do a PATH-scoped restore so
-          # the S3 unlock in access.ts stays untouched while the flavor handling
-          # comes back (otherwise gradle cannot resolve mergeUniversalRelease*).
-          git checkout -- src-tauri/gen/android
+          # Whole-repo `git checkout .` exactly like official nightly: it reverts
+          # whatever `tauri android init` / `tauri icon` wrote to TRACKED files
+          # (tauri.conf.json, package.json, and gen/android's customized
+          # build.gradle.kts that carries missingDimensionStrategy("store",
+          # storeFlavor), etc.) while keeping generated-but-untracked resources.
+          # The S3 unlock is safe: access.ts already has it committed in THIS
+          # branch, so checkout . leaves it exactly as committed (premium=false).
+          git checkout .
           grep -q 'missingDimensionStrategy("store"' src-tauri/gen/android/app/build.gradle.kts \
             || { echo "::error::official gen/android template missing store strategy"; exit 1; }
           # Tracked ic_launcher.xml references @color/ic_launcher_background, but
