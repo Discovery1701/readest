@@ -101,6 +101,19 @@ jobs:
           git checkout -- src-tauri/gen/android
           grep -q 'missingDimensionStrategy("store"' src-tauri/gen/android/app/build.gradle.kts \
             || { echo "::error::official gen/android template missing store strategy"; exit 1; }
+          # Tracked ic_launcher.xml references @color/ic_launcher_background, but
+          # tauri init does not emit that color. Provide it (the official default
+          # green, matching drawable/ic_launcher_background.xml) AFTER the checkout
+          # so it survives. Without it: AAPT error color/ic_launcher_background not found.
+          resval=src-tauri/gen/android/app/src/main/res/values
+          mkdir -p "$resval"
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="utf-8"?>' \
+            '<resources>' \
+            '    <color name="ic_launcher_background">#3DDC84</color>' \
+            '</resources>' > "$resval/ic_launcher_background.xml"
+          grep -q 'ic_launcher_background' "$resval/ic_launcher_background.xml" \
+            || { echo "::error::failed to write ic_launcher_background color"; exit 1; }
           # Generate a throwaway signing keystore for the release APK and point
           # gradle at it. Provide every property key the Tauri template may read.
           keytool -genkeypair -v \
