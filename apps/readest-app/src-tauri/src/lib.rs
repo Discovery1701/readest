@@ -690,6 +690,8 @@ pub fn run() {
             #[cfg(desktop)]
             local_tts::local_tts_status,
             #[cfg(desktop)]
+            local_tts::local_tts_prepare,
+            #[cfg(desktop)]
             local_tts::local_tts_synthesize,
             #[cfg(desktop)]
             spawn_fresh_browser::spawn_fresh_browser,

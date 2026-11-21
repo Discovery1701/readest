@@ -1,5 +1,6 @@
 import { FoliateView, ViewTTS } from '@/types/view';
 import { AppService } from '@/types/system';
+import { isTauriAppPlatform } from '@/services/environment';
 import type { PageInfo, PairedAudiobook } from '@/types/book';
 import { SectionItem } from '@/libs/document';
 import { convertFileSrc } from '@tauri-apps/api/core';
@@ -18,6 +19,7 @@ import { expandRangeOverRuby } from '@/utils/ruby';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
+import { LocalNeuralTTSClient } from './LocalNeuralTTSClient';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { hydrateProvisionalDurations } from './ttsDuration';
 import { DownloadableSentence, SectionEnumerator, TTSDownloader } from './TTSDownloader';
@@ -194,10 +196,12 @@ export class TTSController extends EventTarget {
   ttsClient: TTSClient;
   ttsWebClient: TTSClient;
   ttsEdgeClient: EdgeTTSClient;
+  ttsLocalClient: LocalNeuralTTSClient | null = null;
   ttsNativeClient: TTSClient | null = null;
   ttsMediaOverlayClient: MediaOverlayClient;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
+  ttsLocalVoices: TTSVoice[] = [];
   ttsNativeVoices: TTSVoice[] = [];
   ttsTargetLang: string = '';
 
@@ -213,6 +217,11 @@ export class TTSController extends EventTarget {
     super();
     this.ttsWebClient = new WebSpeechClient(this);
     this.ttsEdgeClient = new EdgeTTSClient(this, appService);
+    // Local neural TTS (ZipVoice via sherpa-onnx) is Tauri-command backed; on
+    // the desktop portable build it shows up as a "本地语音" voice group.
+    if (isTauriAppPlatform()) {
+      this.ttsLocalClient = new LocalNeuralTTSClient(this, appService);
+    }
     // Native TTS is backed by Android TextToSpeech and iOS AVSpeechSynthesizer.
     // TODO: implement native TTS client for desktop platforms.
     if (appService?.isAndroidApp || appService?.isIOSApp) {
@@ -400,6 +409,10 @@ export class TTSController extends EventTarget {
     if (await this.ttsEdgeClient.init()) {
       availableClients.push(this.ttsEdgeClient);
     }
+    if (this.ttsLocalClient && (await this.ttsLocalClient.init())) {
+      availableClients.push(this.ttsLocalClient);
+      this.ttsLocalVoices = await this.ttsLocalClient.getAllVoices();
+    }
     if (this.ttsNativeClient && (await this.ttsNativeClient.init())) {
       availableClients.push(this.ttsNativeClient);
       this.ttsNativeVoices = await this.ttsNativeClient.getAllVoices();
@@ -419,6 +432,9 @@ export class TTSController extends EventTarget {
     }
     this.ttsWebVoices = await this.ttsWebClient.getAllVoices();
     this.ttsEdgeVoices = await this.ttsEdgeClient.getAllVoices();
+    if (this.ttsLocalClient?.initialized) {
+      this.ttsLocalVoices = await this.ttsLocalClient.getAllVoices();
+    }
 
     // A book that ships its own narration should be read by its narrator, not
     // synthesized — that is the whole point of having the recording. The
@@ -1784,6 +1800,7 @@ export class TTSController extends EventTarget {
 
   async setPrimaryLang(lang: string) {
     if (this.ttsEdgeClient.initialized) this.ttsEdgeClient.setPrimaryLang(lang);
+    if (this.ttsLocalClient?.initialized) this.ttsLocalClient.setPrimaryLang(lang);
     if (this.ttsWebClient.initialized) this.ttsWebClient.setPrimaryLang(lang);
     if (this.ttsNativeClient?.initialized) this.ttsNativeClient?.setPrimaryLang(lang);
     if (this.ttsMediaOverlayClient.initialized) this.ttsMediaOverlayClient.setPrimaryLang(lang);
@@ -1801,6 +1818,7 @@ export class TTSController extends EventTarget {
   async getVoices(lang: string) {
     const ttsWebVoices = await this.ttsWebClient.getVoices(lang);
     const ttsEdgeVoices = await this.ttsEdgeClient.getVoices(lang);
+    const ttsLocalVoices = (await this.ttsLocalClient?.getVoices(lang)) ?? [];
     const ttsNativeVoices = (await this.ttsNativeClient?.getVoices(lang)) ?? [];
     // The book's own narrator leads the list when there is one: it is the best
     // voice available for that book by a wide margin.
@@ -1811,6 +1829,7 @@ export class TTSController extends EventTarget {
     const voicesGroups = [
       ...narrationVoices,
       ...ttsNativeVoices,
+      ...ttsLocalVoices,
       ...ttsEdgeVoices,
       ...ttsWebVoices,
     ];
@@ -1843,11 +1862,20 @@ export class TTSController extends EventTarget {
     const useEdgeTTS = !!this.ttsEdgeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
+    const useLocalTTS = !!this.ttsLocalVoices.find(
+      (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
+    );
     const useNativeTTS = !!this.ttsNativeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
     if (useEdgeTTS) {
       this.ttsClient = this.ttsEdgeClient;
+      await this.ttsClient.setRate(this.ttsRate);
+    } else if (useLocalTTS) {
+      if (!this.ttsLocalClient) {
+        throw new Error('Local TTS client is not available');
+      }
+      this.ttsClient = this.ttsLocalClient;
       await this.ttsClient.setRate(this.ttsRate);
     } else if (useNativeTTS) {
       if (!this.ttsNativeClient) {
@@ -2188,6 +2216,9 @@ export class TTSController extends EventTarget {
     }
     if (this.ttsEdgeClient.initialized) {
       await this.ttsEdgeClient.shutdown();
+    }
+    if (this.ttsLocalClient?.initialized) {
+      await this.ttsLocalClient.shutdown();
     }
     if (this.ttsNativeClient?.initialized) {
       await this.ttsNativeClient.shutdown();

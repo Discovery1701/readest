@@ -4,19 +4,19 @@
 //! live next to the portable executable under `<exe_dir>/models/zipvoice/`
 //! (deliberately NOT the user profile, so a portable build stays self-contained).
 //!
-//! Stage 0: load + synthesize + WAV encoding + status only. Model download is a
-//! later step; until then the files must already be present in that directory.
+//! `local_tts_prepare` downloads the models on first use; `local_tts_synthesize`
+//! turns text into a 16-bit mono WAV (base64 for IPC). The reference clip
+//! (`leijun-1.wav`) + its transcript define the default voice via ZipVoice
+//! zero-shot cloning, so it works out of the box.
 //!
-//! Expected layout under models/zipvoice/:
+//! Expected layout under models/zipvoice/ after prepare:
 //!   vocos_24khz.onnx
 //!   lexicon-en-us.txt
 //!   sherpa-onnx-zipvoice-distill-int8-zh-en-emilia/
 //!     encoder.int8.onnx  decoder.int8.onnx  tokens.txt  lexicon.txt
 //!     test_wavs/leijun-1.wav
-//!
-//! The reference clip (`leijun-1.wav`) + its transcript define the default
-//! voice via ZipVoice zero-shot cloning, so it works out of the box.
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -36,8 +36,14 @@ const REFERENCE_WAV: &str = "test_wavs/leijun-1.wav";
 /// Transcript of the reference clip (must match it word-for-word).
 const REFERENCE_TEXT: &str = "那还是三十六年前, 一九八七年. 我呢考上了武汉大学的计算机系.";
 
-/// Files that must exist (relative to the model dir) for the engine to run.
-const REQUIRED_FILES: &[&str] = &[
+const URL_ZIPVOICE: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2";
+const URL_VOCODER: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx";
+const URL_LEXICON_EN: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/lexicon-en-us.txt";
+
+/// Files that must exist (relative to the ZipVoice model subdir).
+const REQUIRED_ZW_FILES: &[&str] = &[
     "encoder.int8.onnx",
     "decoder.int8.onnx",
     "tokens.txt",
@@ -79,21 +85,10 @@ pub struct LocalTtsStatus {
     pub missing: Vec<String>,
 }
 
-#[tauri::command]
-pub fn local_tts_status() -> LocalTtsStatus {
-    let dir = model_dir().unwrap_or_default();
-    let missing = missing_files(&dir);
-    LocalTtsStatus {
-        model_dir: dir.to_string_lossy().into_owned(),
-        ready: missing.is_empty(),
-        missing,
-    }
-}
-
 fn missing_files(dir: &Path) -> Vec<String> {
     let zp = dir.join(ZIPVOICE_DIR);
     let mut missing = Vec::new();
-    for rel in REQUIRED_FILES {
+    for rel in REQUIRED_ZW_FILES {
         if !zp.join(rel).exists() {
             missing.push(format!("{ZIPVOICE_DIR}/{rel}"));
         }
@@ -105,6 +100,89 @@ fn missing_files(dir: &Path) -> Vec<String> {
         missing.push("lexicon-en-us.txt".to_string());
     }
     missing
+}
+
+fn status_of(dir: &Path) -> LocalTtsStatus {
+    let missing = missing_files(dir);
+    LocalTtsStatus {
+        model_dir: dir.to_string_lossy().into_owned(),
+        ready: missing.is_empty(),
+        missing,
+    }
+}
+
+#[tauri::command]
+pub fn local_tts_status() -> LocalTtsStatus {
+    match model_dir() {
+        Ok(dir) => status_of(&dir),
+        Err(e) => LocalTtsStatus {
+            model_dir: String::new(),
+            ready: false,
+            missing: vec![e],
+        },
+    }
+}
+
+async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {url} -> HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("read body {url}: {e}"))?;
+    Ok(bytes.to_vec())
+}
+
+fn extract_tar_bz2(data: &[u8], dest: &Path) -> Result<(), String> {
+    let decoder = bzip2::read::BzDecoder::new(Cursor::new(data));
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(dest)
+        .map_err(|e| format!("untar into {} failed: {e}", dest.display()))?;
+    Ok(())
+}
+
+/// Download any missing model files into `<exe_dir>/models/zipvoice/`.
+///
+/// Idempotent: already-present files are skipped. ~156 MB on first run.
+#[tauri::command]
+pub async fn local_tts_prepare() -> Result<LocalTtsStatus, String> {
+    let dir = model_dir()?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let zp = dir.join(ZIPVOICE_DIR);
+
+    if REQUIRED_ZW_FILES.iter().any(|rel| !zp.join(rel).exists()) {
+        log::info!("local_tts: downloading ZipVoice package…");
+        let data = http_get_bytes(URL_ZIPVOICE).await?;
+        let dest = dir.clone();
+        tauri::async_runtime::spawn_blocking(move || extract_tar_bz2(&data, &dest))
+            .await
+            .map_err(|e| format!("untar task join: {e}"))??;
+    }
+
+    if !dir.join("vocos_24khz.onnx").exists() {
+        log::info!("local_tts: downloading vocoder…");
+        let data = http_get_bytes(URL_VOCODER).await?;
+        tokio::fs::write(dir.join("vocos_24khz.onnx"), &data)
+            .await
+            .map_err(|e| format!("write vocoder: {e}"))?;
+    }
+
+    if !dir.join("lexicon-en-us.txt").exists() {
+        log::info!("local_tts: downloading en lexicon…");
+        let data = http_get_bytes(URL_LEXICON_EN).await?;
+        tokio::fs::write(dir.join("lexicon-en-us.txt"), &data)
+            .await
+            .map_err(|e| format!("write lexicon: {e}"))?;
+    }
+
+    Ok(status_of(&dir))
 }
 
 fn build_engine(dir: &Path) -> Result<TtsEngine, String> {
@@ -140,8 +218,8 @@ fn build_engine(dir: &Path) -> Result<TtsEngine, String> {
         .ok_or_else(|| "OfflineTts::create returned None (check model files)".to_string())?;
 
     let ref_path = zp.join(REFERENCE_WAV).to_string_lossy().into_owned();
-    let wave = Wave::read(&ref_path)
-        .ok_or_else(|| format!("failed to read reference wav: {ref_path}"))?;
+    let wave =
+        Wave::read(&ref_path).ok_or_else(|| format!("failed to read reference wav: {ref_path}"))?;
 
     log::info!(
         "local_tts: engine created, sample_rate={}, reference={} samples",
@@ -161,7 +239,7 @@ fn synth_blocking(text: &str, speed: f32) -> Result<Vec<u8>, String> {
     let missing = missing_files(&dir);
     if !missing.is_empty() {
         return Err(format!(
-            "local TTS models missing in {}: {}",
+            "local TTS models missing in {} (call local_tts_prepare): {}",
             dir.to_string_lossy(),
             missing.join(", ")
         ));
