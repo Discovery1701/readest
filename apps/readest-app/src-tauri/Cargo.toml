@@ -220,6 +220,10 @@ tauri-plugin-dialog = "2"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-cli = "2"
+# Local neural TTS (ZipVoice) via sherpa-onnx, desktop only. The default `static`
+# feature links a prebuilt onnxruntime that build.rs downloads once on Windows
+# MSVC. Used only by the self-hosted "local TTS" engine in src/local_tts.rs.
+sherpa-onnx = "2.0.2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-window-state = "2"

@@ -40,6 +40,8 @@ mod linux_display;
 #[cfg(all(target_os = "linux", any(feature = "cef", test)))]
 mod linux_single_instance;
 mod localsend;
+#[cfg(desktop)]
+mod local_tts;
 #[cfg(target_os = "macos")]
 mod macos;
 mod media_proxy;
@@ -685,6 +687,10 @@ pub fn run() {
             localsend::commands::localsend_cancel_receive,
             localsend::commands::localsend_send_files,
             localsend::commands::localsend_cancel_send,
+            #[cfg(desktop)]
+            local_tts::local_tts_status,
+            #[cfg(desktop)]
+            local_tts::local_tts_synthesize,
             #[cfg(desktop)]
             spawn_fresh_browser::spawn_fresh_browser,
             nightly_update::verify_update_signature,
