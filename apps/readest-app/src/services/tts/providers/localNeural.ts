@@ -29,6 +29,14 @@ const logToBackend = (msg: string) => {
 const decodeBase64Wav = (base64: string): ArrayBuffer => {
   const comma = base64.indexOf(',');
   const payload = (comma >= 0 ? base64.slice(comma + 1) : base64).replace(/\s/g, '');
+  // Uint8Array.fromBase64 is much faster than the atob loop and avoids
+  // building a large binary string on the JS heap; fall back on older
+  // WebView2 builds that lack it.
+  const fromBase64 = (Uint8Array as unknown as { fromBase64?: (s: string) => Uint8Array })
+    .fromBase64;
+  if (fromBase64) {
+    return fromBase64(payload).buffer as ArrayBuffer;
+  }
   const binary = atob(payload);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) {
@@ -142,7 +150,11 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
       const oldest = this.#audioCache.keys().next().value;
       if (oldest !== undefined) this.#audioCache.delete(oldest);
     }
-    this.#audioCache.set(cacheKey, new Uint8Array(audio));
+    // Store an independent copy: decodeAudioData() detaches the buffer we
+    // return, so a view sharing that buffer would become out of bounds.
+    const stored = new Uint8Array(audio.byteLength);
+    stored.set(new Uint8Array(audio));
+    this.#audioCache.set(cacheKey, stored);
 
     return { audio, boundaries: [] };
   }
