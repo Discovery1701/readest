@@ -19,7 +19,7 @@ import { expandRangeOverRuby } from '@/utils/ruby';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
-import { LocalNeuralTTSClient } from './LocalNeuralTTSClient';
+import type { LocalNeuralTTSClient } from './LocalNeuralTTSClient';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { hydrateProvisionalDurations } from './ttsDuration';
 import { DownloadableSentence, SectionEnumerator, TTSDownloader } from './TTSDownloader';
@@ -217,11 +217,9 @@ export class TTSController extends EventTarget {
     super();
     this.ttsWebClient = new WebSpeechClient(this);
     this.ttsEdgeClient = new EdgeTTSClient(this, appService);
-    // Local neural TTS (ZipVoice via sherpa-onnx) is Tauri-command backed; on
-    // the desktop portable build it shows up as a "本地语音" voice group.
-    if (isTauriAppPlatform()) {
-      this.ttsLocalClient = new LocalNeuralTTSClient(this, appService);
-    }
+    // Local neural TTS (ZipVoice, sherpa-onnx) is created lazily in init() via
+    // dynamic import: loading it statically reorders the TTSController <->
+    // BufferedTTSClient cycle and crashes `next build` with a TDZ error.
     // Native TTS is backed by Android TextToSpeech and iOS AVSpeechSynthesizer.
     // TODO: implement native TTS client for desktop platforms.
     if (appService?.isAndroidApp || appService?.isIOSApp) {
@@ -406,6 +404,10 @@ export class TTSController extends EventTarget {
 
   async init() {
     const availableClients = [];
+    if (isTauriAppPlatform() && !this.ttsLocalClient) {
+      const { LocalNeuralTTSClient } = await import('./LocalNeuralTTSClient');
+      this.ttsLocalClient = new LocalNeuralTTSClient(this, this.appService);
+    }
     if (await this.ttsEdgeClient.init()) {
       availableClients.push(this.ttsEdgeClient);
     }
