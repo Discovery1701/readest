@@ -160,7 +160,10 @@ fn builtin_models() -> Vec<ModelSpec> {
             model: Some("model.onnx".to_string()),
             tokens: Some("tokens.txt".to_string()),
             lexicons: vec!["lexicon.txt".to_string()],
-            rule_fsts: vec!["date.fst".to_string(), "number.fst".to_string()],
+            // sherpa-onnx re-applies rule_fsts on every generate call; the
+            // MeloTTS date/number FSTs added ~36 s per sentence on Windows, so
+            // they are deliberately left out.
+            rule_fsts: Vec::new(),
             dict_dir: None,
             lang: Some("zh-CN".to_string()),
             size_mb: Some(159),
