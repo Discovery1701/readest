@@ -9,7 +9,7 @@ import type {
 
 export const LOCAL_NEURAL_PROVIDER_ID = 'local-neural';
 /** Fallback when the backend catalog cannot be read. */
-export const LOCAL_NEURAL_DEFAULT_VOICE_ID = 'piper-zh-xiaoya';
+export const LOCAL_NEURAL_DEFAULT_VOICE_ID = 'matcha-zh-baker';
 
 interface LocalTtsModelInfo {
   id: string;
@@ -89,7 +89,7 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
       return [
         {
           id: LOCAL_NEURAL_DEFAULT_VOICE_ID,
-          name: 'Piper 中文·小雅（快）',
+          name: 'Matcha 中文',
           lang: 'zh-CN',
         },
       ];

@@ -208,7 +208,7 @@ fn builtin_models() -> Vec<ModelSpec> {
             rule_fsts: Vec::new(),
             dict_dir: Some("dict".to_string()),
             lang: Some("zh-CN".to_string()),
-            size_mb: Some(123),
+            size_mb: Some(146),
             params: ModelParams {
                 num_threads: Some(4),
                 ..Default::default()
