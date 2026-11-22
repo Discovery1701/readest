@@ -150,6 +150,28 @@ fn builtin_models() -> Vec<ModelSpec> {
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models";
     let mut list = vec![
         ModelSpec {
+            id: "piper-zh-xiaoya".to_string(),
+            label: "Piper 中文·小雅（快）".to_string(),
+            kind: ModelKind::Vits,
+            dir: "vits-piper-zh_CN-xiao_ya-medium-int8".to_string(),
+            url: Some(format!(
+                "{tts_models}/vits-piper-zh_CN-xiao_ya-medium-int8.tar.bz2"
+            )),
+            vocoder_url: None,
+            vocoder: None,
+            model: Some("zh_CN-xiao_ya-medium.onnx".to_string()),
+            tokens: Some("tokens.txt".to_string()),
+            lexicons: vec!["lexicon.txt".to_string()],
+            rule_fsts: Vec::new(),
+            dict_dir: None,
+            lang: Some("zh-CN".to_string()),
+            size_mb: Some(13),
+            params: ModelParams {
+                num_threads: Some(4),
+                ..Default::default()
+            },
+        },
+        ModelSpec {
             id: "melo-tts-zh-en".to_string(),
             label: "MeloTTS 中英".to_string(),
             kind: ModelKind::Vits,
@@ -416,6 +438,31 @@ pub async fn local_tts_prepare(model_id: String) -> Result<ModelInfo, String> {
 
     let info = info_of(&root, spec);
     debug_log(&format!("prepare: ready={}", info.ready));
+    if info.ready {
+        // Warm the engine off the request path. Loading a model (170 MB for
+        // MeloTTS) takes several seconds; paying that on the first sentence
+        // looks like a hang to the reader.
+        let warm_root = root.clone();
+        let warm_spec = spec.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let already = engine_cell()
+                .lock()
+                .map(|guard| guard.as_ref().is_some_and(|e| e.id == warm_spec.id))
+                .unwrap_or(false);
+            if already {
+                return;
+            }
+            match build_engine(&warm_root, &warm_spec) {
+                Ok(engine) => {
+                    debug_log(&format!("prepare: engine warmed ({})", warm_spec.id));
+                    if let Ok(mut guard) = engine_cell().lock() {
+                        *guard = Some(engine);
+                    }
+                }
+                Err(e) => debug_log(&format!("prepare: warm failed: {e}")),
+            }
+        });
+    }
     Ok(info)
 }
 

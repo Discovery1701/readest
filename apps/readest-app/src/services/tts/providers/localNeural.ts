@@ -9,7 +9,7 @@ import type {
 
 export const LOCAL_NEURAL_PROVIDER_ID = 'local-neural';
 /** Fallback when the backend catalog cannot be read. */
-export const LOCAL_NEURAL_DEFAULT_VOICE_ID = 'melo-tts-zh-en';
+export const LOCAL_NEURAL_DEFAULT_VOICE_ID = 'piper-zh-xiaoya';
 
 interface LocalTtsModelInfo {
   id: string;
@@ -66,6 +66,12 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
   #models: LocalTtsModelInfo[] | null = null;
   #modelsPromise: Promise<LocalTtsModelInfo[]> | null = null;
   #prepare = new Map<string, Promise<boolean>>();
+  /**
+   * Short-lived PCM cache keyed by model+voice+text. `TTSController` first
+   * synthesizes upcoming sentences to preload them and then synthesizes the
+   * same text again for playback; without this the reader waits twice.
+   */
+  #audioCache = new Map<string, Uint8Array>();
 
   async init(): Promise<boolean> {
     logToBackend(`init: isTauri=${isTauriAppPlatform()}`);
@@ -83,7 +89,7 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
       return [
         {
           id: LOCAL_NEURAL_DEFAULT_VOICE_ID,
-          name: 'MeloTTS 中英',
+          name: 'Piper 中文·小雅（快）',
           lang: 'zh-CN',
         },
       ];
@@ -102,6 +108,12 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
     signal: AbortSignal,
   ): Promise<SpeechSynthesisResult> {
     const modelId = req.voice || LOCAL_NEURAL_DEFAULT_VOICE_ID;
+    const cacheKey = `${modelId}\u0000${req.pitch}\u0000${req.text}`;
+    const cached = this.#audioCache.get(cacheKey);
+    if (cached) {
+      // decodeAudioData() detaches the buffer it is handed, so return a copy.
+      return { audio: cached.slice().buffer as ArrayBuffer, boundaries: [] };
+    }
     logToBackend(`synth: model=${modelId} len=${req.text.length}`);
     const ready = await abortable(this.#ensurePrepared(modelId), signal);
     logToBackend(`synth: model=${modelId} prepared=${ready}`);
@@ -125,6 +137,12 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
     if (audio.byteLength === 0) {
       throw new Error('Local TTS returned empty audio');
     }
+
+    if (this.#audioCache.size >= 16) {
+      const oldest = this.#audioCache.keys().next().value;
+      if (oldest !== undefined) this.#audioCache.delete(oldest);
+    }
+    this.#audioCache.set(cacheKey, new Uint8Array(audio));
 
     return { audio, boundaries: [] };
   }
