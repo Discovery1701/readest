@@ -227,7 +227,7 @@ tauri-plugin-cli = "2"
 sherpa-onnx = "2.0.2"
 # Runtime model auto-download: fetch the ZipVoice tarball and unpack in-process
 # into <exe_dir>/models/zipvoice/. Desktop only.
-bzip2 = { version = "0.4", features = ["bundled"] }
+bzip2 = "0.4"
 tar = "0.4"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
