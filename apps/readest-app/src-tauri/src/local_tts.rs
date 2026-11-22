@@ -12,7 +12,7 @@
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -105,7 +105,9 @@ pub struct ModelInfo {
 
 struct TtsEngine {
     id: String,
-    tts: OfflineTts,
+    /// Per-model lock: one `OfflineTts` instance is not safe to drive
+    /// concurrently, but unrelated models must not queue behind each other.
+    tts: Mutex<OfflineTts>,
     /// ZipVoice only: reference PCM + sample rate cached at build time.
     reference: Option<(Vec<f32>, i32)>,
 }
@@ -116,9 +118,9 @@ struct TtsEngine {
 /// sentence pay the model load again.
 const MAX_ENGINES: usize = 2;
 
-static ENGINES: OnceLock<Mutex<Vec<TtsEngine>>> = OnceLock::new();
+static ENGINES: OnceLock<Mutex<Vec<Arc<TtsEngine>>>> = OnceLock::new();
 
-fn engine_cell() -> &'static Mutex<Vec<TtsEngine>> {
+fn engine_cell() -> &'static Mutex<Vec<Arc<TtsEngine>>> {
     ENGINES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -465,7 +467,7 @@ pub async fn local_tts_prepare(model_id: String) -> Result<ModelInfo, String> {
                         if guard.len() >= MAX_ENGINES {
                             guard.remove(0);
                         }
-                        guard.push(engine);
+guard.push(Arc::new(engine));
                     }
                 }
                 Err(e) => debug_log(&format!("prepare: warm failed: {e}")),
@@ -623,7 +625,7 @@ fn build_engine(root: &Path, spec: &ModelSpec) -> Result<TtsEngine, String> {
 
     Ok(TtsEngine {
         id: spec.id.clone(),
-        tts,
+        tts: Mutex::new(tts),
         reference,
     })
 }
@@ -642,10 +644,22 @@ fn synth_blocking(model_id: &str, text: &str, speed: f32) -> Result<Vec<u8>, Str
     }
 
     let cell = engine_cell();
-    let mut guard = cell.lock().map_err(|e| format!("tts lock poisoned: {e}"))?;
-    let engine = match guard.iter().position(|e| e.id == spec.id) {
-        Some(idx) => guard.remove(idx),
-        None => build_engine(&root, spec)?,
+    // Hold the registry lock only for lookup/insertion: synthesis itself must
+    // not serialize requests for unrelated models.
+    let entry = {
+        let mut guard = cell.lock().map_err(|e| format!("tts lock poisoned: {e}"))?;
+        if let Some(idx) = guard.iter().position(|e| e.id == spec.id) {
+            let entry = guard.remove(idx);
+            guard.push(entry.clone());
+            entry
+        } else {
+            let entry = Arc::new(build_engine(&root, spec)?);
+            if guard.len() >= MAX_ENGINES {
+                guard.remove(0);
+            }
+            guard.push(entry.clone());
+            entry
+        }
     };
 
     let mut gen = GenerationConfig {
@@ -653,7 +667,7 @@ fn synth_blocking(model_id: &str, text: &str, speed: f32) -> Result<Vec<u8>, Str
         sid: spec.params.sid.unwrap_or(0),
         ..Default::default()
     };
-    if let Some((reference, rate)) = &engine.reference {
+    if let Some((reference, rate)) = &entry.reference {
         gen.reference_audio = Some(reference.clone());
         gen.reference_sample_rate = *rate;
         gen.reference_text = Some(ZIPVOICE_REFERENCE_TEXT.to_string());
@@ -665,10 +679,11 @@ fn synth_blocking(model_id: &str, text: &str, speed: f32) -> Result<Vec<u8>, Str
         spec.id,
         text.chars().count()
     ));
-    let audio = match engine
+    let tts = entry
         .tts
-        .generate_with_config(text, &gen, None::<fn(&[f32], f32) -> bool>)
-    {
+        .lock()
+        .map_err(|e| format!("tts lock poisoned: {e}"))?;
+    let audio = match tts.generate_with_config(text, &gen, None::<fn(&[f32], f32) -> bool>) {
         Some(a) => a,
         None => {
             debug_log("synth: generate_with_config returned None");
@@ -680,11 +695,6 @@ fn synth_blocking(model_id: &str, text: &str, speed: f32) -> Result<Vec<u8>, Str
     debug_log(&format!("synth: ok samples={n} rate={sr}"));
     let wav = f32_to_wav(audio.samples(), sr);
     drop(audio);
-    // Put the engine back as most-recently-used, evicting the oldest.
-    if guard.len() >= MAX_ENGINES {
-        guard.remove(0);
-    }
-    guard.push(engine);
     Ok(wav)
 }
 

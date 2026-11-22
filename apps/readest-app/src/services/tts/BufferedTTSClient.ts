@@ -303,10 +303,13 @@ export class BufferedTTSClient implements TTSClient {
   }
 
   async *#preload(marks: TTSMark[], signal: AbortSignal) {
-    // Fetch the first couple of marks immediately and the rest in the
+    // Fetch the first couple of marks immediately and a bounded tail in the
     // background; the provider's in-flight dedup keeps this from racing
-    // duplicate requests against the playback scheduler.
+    // duplicate requests against the playback scheduler. The tail is capped
+    // because every preloaded sentence competes with the sentence that is
+    // about to play for the same synthesis slot.
     const maxImmediate = 2;
+    const maxTotal = 6;
     for (let i = 0; i < Math.min(maxImmediate, marks.length); i++) {
       if (signal.aborted) break;
       const mark = marks[i]!;
@@ -321,7 +324,7 @@ export class BufferedTTSClient implements TTSClient {
     }
     if (marks.length > maxImmediate) {
       (async () => {
-        for (let i = maxImmediate; i < marks.length; i++) {
+        for (let i = maxImmediate; i < Math.min(marks.length, maxTotal); i++) {
           const mark = marks[i]!;
           try {
             if (signal.aborted) break;

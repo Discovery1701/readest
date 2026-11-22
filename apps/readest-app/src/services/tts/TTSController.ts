@@ -1471,7 +1471,7 @@ export class TTSController extends EventTarget {
     for await (const _ of iter);
   }
 
-  async preloadNextSSML(count: number = 4) {
+  async preloadNextSSML(count: number = 2) {
     // speak()/start()/forward() all call this; stacking batches saturates the
     // CPU (every batch re-synthesizes several sentences) and starves playback.
     if (this.#preloadPromise) return;
