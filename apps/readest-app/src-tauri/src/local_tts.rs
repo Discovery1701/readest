@@ -75,6 +75,18 @@ fn model_dir() -> Result<PathBuf, String> {
     Ok(exe_dir()?.join(MODEL_SUBDIR))
 }
 
+/// Append a line to `<exe_dir>/tts-debug.log` so field issues are diagnosable
+/// without devtools. Best-effort: logging failures are ignored.
+fn debug_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(dir) = exe_dir() {
+        let path = dir.join("tts-debug.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct LocalTtsStatus {
     /// Absolute path of the model directory (for "place files here" hints).
@@ -214,8 +226,17 @@ fn build_engine(dir: &Path) -> Result<TtsEngine, String> {
         ..Default::default()
     };
 
-    let tts = OfflineTts::create(&config)
-        .ok_or_else(|| "OfflineTts::create returned None (check model files)".to_string())?;
+    debug_log(&format!("build_engine: creating OfflineTts (dir={})", dir.display()));
+    let tts = match OfflineTts::create(&config) {
+        Some(t) => {
+            debug_log("build_engine: OfflineTts created");
+            t
+        }
+        None => {
+            debug_log("build_engine: OfflineTts::create returned None");
+            return Err("OfflineTts::create returned None (check model files)".to_string());
+        }
+    };
 
     let ref_path = zp.join(REFERENCE_WAV).to_string_lossy().into_owned();
     let wave =
@@ -261,12 +282,21 @@ fn synth_blocking(text: &str, speed: f32) -> Result<Vec<u8>, String> {
         ..Default::default()
     };
 
-    let audio = engine
+    debug_log(&format!("synth: text_len={} generating…", text.chars().count()));
+    let audio = match engine
         .tts
         .generate_with_config(text, &gen, None::<fn(&[f32], f32) -> bool>)
-        .ok_or_else(|| "generation failed".to_string())?;
-
-    Ok(f32_to_wav(audio.samples(), audio.sample_rate()))
+    {
+        Some(a) => a,
+        None => {
+            debug_log("synth: generate_with_config returned None");
+            return Err("generation failed".to_string());
+        }
+    };
+    let sr = audio.sample_rate();
+    let n = audio.samples().len();
+    debug_log(&format!("synth: ok samples={n} rate={sr}"));
+    Ok(f32_to_wav(audio.samples(), sr))
 }
 
 /// Synthesize `text` and return a 16-bit mono WAV, base64-encoded for IPC.
@@ -277,10 +307,16 @@ fn synth_blocking(text: &str, speed: f32) -> Result<Vec<u8>, String> {
 #[tauri::command]
 pub async fn local_tts_synthesize(text: String, speed: Option<f32>) -> Result<String, String> {
     let speed = speed.unwrap_or(1.0);
-    let wav = tauri::async_runtime::spawn_blocking(move || synth_blocking(&text, speed))
+    let result = tauri::async_runtime::spawn_blocking(move || synth_blocking(&text, speed))
         .await
-        .map_err(|e| format!("tts task join error: {e}"))??;
-    Ok(B64.encode(wav))
+        .map_err(|e| format!("tts task join error: {e}"))?;
+    match result {
+        Ok(wav) => Ok(B64.encode(wav)),
+        Err(e) => {
+            debug_log(&format!("synthesize error: {e}"));
+            Err(e)
+        }
+    }
 }
 
 /// Encode normalized f32 PCM (mono) into a 16-bit WAV byte buffer.
