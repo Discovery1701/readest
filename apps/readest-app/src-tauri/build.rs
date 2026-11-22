@@ -81,6 +81,7 @@ fn main() {
             "localsend_cancel_receive",
             "localsend_send_files",
             "localsend_cancel_send",
+            "local_tts_list_models",
             "local_tts_status",
             "local_tts_log",
             "local_tts_prepare",

@@ -1,60 +1,113 @@
-//! Local neural TTS (ZipVoice via sherpa-onnx), desktop only.
+//! Local neural TTS via sherpa-onnx, desktop only.
 //!
-//! This backs a self-hosted "local TTS" engine: no cloud, no account. Models
-//! live next to the portable executable under `<exe_dir>/models/zipvoice/`
-//! (deliberately NOT the user profile, so a portable build stays self-contained).
+//! Model-agnostic: a catalog describes downloadable models. The built-in list
+//! can be extended or overridden at runtime by `<exe>/models/catalog.json`, so
+//! adding or switching models does not require a rebuild.
 //!
-//! `local_tts_prepare` downloads the models on first use; `local_tts_synthesize`
-//! turns text into a 16-bit mono WAV (base64 for IPC). The reference clip
-//! (`leijun-1.wav`) + its transcript define the default voice via ZipVoice
-//! zero-shot cloning, so it works out of the box.
+//! Each model becomes a selectable "voice"; `local_tts_synthesize` receives the
+//! model id and lazily downloads + builds that model on first use. Result is a
+//! 16-bit mono WAV, base64-encoded for IPC.
 //!
-//! Expected layout under models/zipvoice/ after prepare:
-//!   vocos_24khz.onnx
-//!   lexicon-en-us.txt
-//!   sherpa-onnx-zipvoice-distill-int8-zh-en-emilia/
-//!     encoder.int8.onnx  decoder.int8.onnx  tokens.txt  lexicon.txt
-//!     test_wavs/leijun-1.wav
+//! Layout: `<exe>/models/<spec.dir>/…` with the model files unpacked in place.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sherpa_onnx::{
-    GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsModelConfig,
-    OfflineTtsZipvoiceModelConfig, Wave,
+    GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsMatchaModelConfig,
+    OfflineTtsModelConfig, OfflineTtsVitsModelConfig, OfflineTtsZipvoiceModelConfig, Wave,
 };
 
-/// Sub-directory of the exe folder that holds the models.
-const MODEL_SUBDIR: &str = "models/zipvoice";
-/// Directory name produced by extracting the ZipVoice tarball.
-const ZIPVOICE_DIR: &str = "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia";
-/// Reference clip shipped inside the ZipVoice model dir.
-const REFERENCE_WAV: &str = "test_wavs/leijun-1.wav";
-/// Transcript of the reference clip (must match it word-for-word).
-const REFERENCE_TEXT: &str = "那还是三十六年前, 一九八七年. 我呢考上了武汉大学的计算机系.";
+/// Sub-directory of the exe folder that holds models + catalog.
+const MODELS_SUBDIR: &str = "models";
+/// Optional runtime catalog, merged over the built-in model list.
+const CATALOG_FILE: &str = "catalog.json";
+/// Reference clip inside the ZipVoice model dir (zero-shot voice prompt).
+const ZIPVOICE_REFERENCE: &str = "test_wavs/leijun-1.wav";
+/// Transcript of the ZipVoice reference clip (must match word for word).
+const ZIPVOICE_REFERENCE_TEXT: &str = "那还是三十六年前, 一九八七年. 我呢考上了武汉大学的计算机系.";
+const ZIPVOICE_ENCODER: &str = "encoder.int8.onnx";
+const ZIPVOICE_DECODER: &str = "decoder.int8.onnx";
 
-const URL_ZIPVOICE: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2";
-const URL_VOCODER: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx";
-const URL_LEXICON_EN: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/lexicon-en-us.txt";
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    #[default]
+    Vits,
+    Matcha,
+    Zipvoice,
+}
 
-/// Files that must exist (relative to the ZipVoice model subdir).
-const REQUIRED_ZW_FILES: &[&str] = &[
-    "encoder.int8.onnx",
-    "decoder.int8.onnx",
-    "tokens.txt",
-    "lexicon.txt",
-    "test_wavs/leijun-1.wav",
-];
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ModelParams {
+    #[serde(default)]
+    pub noise_scale: Option<f32>,
+    #[serde(default)]
+    pub noise_scale_w: Option<f32>,
+    #[serde(default)]
+    pub length_scale: Option<f32>,
+    #[serde(default)]
+    pub num_threads: Option<i32>,
+    #[serde(default)]
+    pub sid: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ModelSpec {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub kind: ModelKind,
+    /// Directory name under `<exe>/models/` (also the tarball's top directory).
+    pub dir: String,
+    /// Tarball downloaded on first use (may be omitted if files are shipped).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Separate vocoder file downloaded next to the model (Matcha / ZipVoice).
+    #[serde(default)]
+    pub vocoder_url: Option<String>,
+    #[serde(default)]
+    pub vocoder: Option<String>,
+    /// Preferred acoustic model file; falls back to the first `*.onnx` found.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub tokens: Option<String>,
+    #[serde(default)]
+    pub lexicons: Vec<String>,
+    /// Text-normalization FSTs (date/number), joined with commas for sherpa.
+    #[serde(default)]
+    pub rule_fsts: Vec<String>,
+    #[serde(default)]
+    pub dict_dir: Option<String>,
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub size_mb: Option<u32>,
+    #[serde(default)]
+    pub params: ModelParams,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: String,
+    pub lang: String,
+    /// True when the model files are already present on disk.
+    pub ready: bool,
+    pub dir: String,
+    pub missing: Vec<String>,
+    pub size_mb: Option<u32>,
+}
 
 struct TtsEngine {
+    id: String,
     tts: OfflineTts,
-    reference: Vec<f32>,
-    reference_rate: i32,
+    /// ZipVoice only: reference PCM + sample rate cached at build time.
+    reference: Option<(Vec<f32>, i32)>,
 }
 
 static ENGINE: OnceLock<Mutex<Option<TtsEngine>>> = OnceLock::new();
@@ -71,8 +124,8 @@ fn exe_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "executable has no parent directory".to_string())
 }
 
-fn model_dir() -> Result<PathBuf, String> {
-    Ok(exe_dir()?.join(MODEL_SUBDIR))
+fn models_root() -> Result<PathBuf, String> {
+    Ok(exe_dir()?.join(MODELS_SUBDIR))
 }
 
 /// Append a line to `<exe_dir>/tts-debug.log` so field issues are diagnosable
@@ -81,56 +134,204 @@ fn debug_log(msg: &str) {
     use std::io::Write;
     if let Ok(dir) = exe_dir() {
         let path = dir.join("tts-debug.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(f, "{msg}");
         }
     }
 }
 
-#[derive(Serialize)]
-pub struct LocalTtsStatus {
-    /// Absolute path of the model directory (for "place files here" hints).
-    pub model_dir: String,
-    /// True when every required file is present.
-    pub ready: bool,
-    /// Required files that are missing, relative to `model_dir`.
-    pub missing: Vec<String>,
+fn builtin_models() -> Vec<ModelSpec> {
+    let tts_models = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models";
+    let vocoder_models =
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models";
+    let mut list = vec![
+        ModelSpec {
+            id: "melo-tts-zh-en".to_string(),
+            label: "MeloTTS 中英".to_string(),
+            kind: ModelKind::Vits,
+            dir: "vits-melo-tts-zh_en".to_string(),
+            url: Some(format!("{tts_models}/vits-melo-tts-zh_en.tar.bz2")),
+            vocoder_url: None,
+            vocoder: None,
+            model: Some("model.onnx".to_string()),
+            tokens: Some("tokens.txt".to_string()),
+            lexicons: vec!["lexicon.txt".to_string()],
+            rule_fsts: vec!["date.fst".to_string(), "number.fst".to_string()],
+            dict_dir: None,
+            lang: Some("zh-CN".to_string()),
+            size_mb: Some(159),
+            params: ModelParams {
+                num_threads: Some(4),
+                ..Default::default()
+            },
+        },
+        ModelSpec {
+            id: "matcha-zh-baker".to_string(),
+            label: "Matcha 中文".to_string(),
+            kind: ModelKind::Matcha,
+            dir: "matcha-icefall-zh-baker".to_string(),
+            url: Some(format!("{tts_models}/matcha-icefall-zh-baker.tar.bz2")),
+            vocoder_url: Some(format!("{vocoder_models}/vocos-22khz-univ.onnx")),
+            vocoder: Some("vocos-22khz-univ.onnx".to_string()),
+            model: Some("model-steps-3.onnx".to_string()),
+            tokens: Some("tokens.txt".to_string()),
+            lexicons: vec!["lexicon.txt".to_string()],
+            rule_fsts: Vec::new(),
+            dict_dir: Some("dict".to_string()),
+            lang: Some("zh-CN".to_string()),
+            size_mb: Some(123),
+            params: ModelParams {
+                num_threads: Some(4),
+                ..Default::default()
+            },
+        },
+        ModelSpec {
+            id: "zipvoice-zh-en".to_string(),
+            label: "ZipVoice 中英（实验，较慢）".to_string(),
+            kind: ModelKind::Zipvoice,
+            dir: "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia".to_string(),
+            url: Some(format!(
+                "{tts_models}/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2"
+            )),
+            vocoder_url: Some(format!("{vocoder_models}/vocos_24khz.onnx")),
+            vocoder: Some("vocos_24khz.onnx".to_string()),
+            model: None,
+            tokens: Some("tokens.txt".to_string()),
+            lexicons: vec!["lexicon.txt".to_string()],
+            rule_fsts: Vec::new(),
+            dict_dir: None,
+            lang: Some("zh-CN".to_string()),
+            size_mb: Some(156),
+            params: ModelParams {
+                num_threads: Some(4),
+                ..Default::default()
+            },
+        },
+    ];
+    list.shrink_to_fit();
+    list
 }
 
-fn missing_files(dir: &Path) -> Vec<String> {
-    let zp = dir.join(ZIPVOICE_DIR);
-    let mut missing = Vec::new();
-    for rel in REQUIRED_ZW_FILES {
-        if !zp.join(rel).exists() {
-            missing.push(format!("{ZIPVOICE_DIR}/{rel}"));
+fn load_catalog(root: &Path) -> Vec<ModelSpec> {
+    let path = root.join(CATALOG_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<Vec<ModelSpec>>(&text) {
+        Ok(entries) => entries,
+        Err(e) => {
+            debug_log(&format!("catalog: parse {} failed: {e}", path.display()));
+            Vec::new()
         }
     }
-    if !dir.join("vocos_24khz.onnx").exists() {
-        missing.push("vocos_24khz.onnx".to_string());
-    }
-    if !dir.join("lexicon-en-us.txt").exists() {
-        missing.push("lexicon-en-us.txt".to_string());
-    }
-    missing
 }
 
-fn status_of(dir: &Path) -> LocalTtsStatus {
-    let missing = missing_files(dir);
-    LocalTtsStatus {
-        model_dir: dir.to_string_lossy().into_owned(),
-        ready: missing.is_empty(),
+/// Built-in models with `catalog.json` entries merged in (same id replaces).
+fn all_specs(root: &Path) -> Vec<ModelSpec> {
+    let mut specs = builtin_models();
+    for extra in load_catalog(root) {
+        if let Some(pos) = specs.iter().position(|s| s.id == extra.id) {
+            specs[pos] = extra;
+        } else {
+            specs.push(extra);
+        }
+    }
+    specs
+}
+
+fn find_spec<'a>(specs: &'a [ModelSpec], id: &str) -> Result<&'a ModelSpec, String> {
+    specs
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("unknown local TTS model: {id}"))
+}
+
+fn model_dir(root: &Path, spec: &ModelSpec) -> PathBuf {
+    root.join(&spec.dir)
+}
+
+/// A real ONNX file, not a Git LFS pointer stub. MeloTTS ships a 133-byte
+/// `model.int8.onnx` pointer, which must never be picked as the acoustic model.
+fn is_model_onnx(path: &Path) -> bool {
+    let is_onnx = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("onnx"))
+        .unwrap_or(false);
+    is_onnx && path.metadata().is_ok_and(|m| m.len() > 4096)
+}
+
+/// True when a usable acoustic model file is present. The separately
+/// downloaded vocoder lives in the same directory but cannot synthesize alone,
+/// so it must not mark the model as ready.
+fn model_ready(dir: &Path, spec: &ModelSpec) -> bool {
+    resolve_model(spec, dir).is_ok()
+}
+
+fn info_of(root: &Path, spec: &ModelSpec) -> ModelInfo {
+    let dir = model_dir(root, spec);
+    let ready = model_ready(&dir, spec);
+    let mut missing = Vec::new();
+    if !ready {
+        missing.push(spec.dir.clone());
+    }
+    ModelInfo {
+        id: spec.id.clone(),
+        label: spec.label.clone(),
+        lang: spec.lang.clone().unwrap_or_else(|| "zh-CN".to_string()),
+        ready,
+        dir: dir.to_string_lossy().into_owned(),
         missing,
+        size_mb: spec.size_mb,
     }
 }
 
 #[tauri::command]
-pub fn local_tts_status() -> LocalTtsStatus {
-    match model_dir() {
-        Ok(dir) => status_of(&dir),
-        Err(e) => LocalTtsStatus {
-            model_dir: String::new(),
+pub fn local_tts_list_models() -> Vec<ModelInfo> {
+    match models_root() {
+        Ok(root) => all_specs(&root)
+            .iter()
+            .map(|spec| info_of(&root, spec))
+            .collect(),
+        Err(e) => {
+            debug_log(&format!("list_models: {e}"));
+            Vec::new()
+        }
+    }
+}
+
+#[tauri::command]
+pub fn local_tts_status(model_id: Option<String>) -> ModelInfo {
+    let Ok(root) = models_root() else {
+        return ModelInfo {
+            id: String::new(),
+            label: String::new(),
+            lang: "zh-CN".to_string(),
             ready: false,
-            missing: vec![e],
+            dir: String::new(),
+            missing: vec!["cannot resolve executable directory".to_string()],
+            size_mb: None,
+        };
+    };
+    let specs = all_specs(&root);
+    let spec = model_id
+        .as_deref()
+        .and_then(|id| specs.iter().find(|s| s.id == id))
+        .or_else(|| specs.first());
+    match spec {
+        Some(spec) => info_of(&root, spec),
+        None => ModelInfo {
+            id: String::new(),
+            label: String::new(),
+            lang: "zh-CN".to_string(),
+            ready: false,
+            dir: String::new(),
+            missing: vec!["no models configured".to_string()],
+            size_mb: None,
         },
     }
 }
@@ -164,79 +365,179 @@ fn extract_tar_bz2(data: &[u8], dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Download any missing model files into `<exe_dir>/models/zipvoice/`.
-///
-/// Idempotent: already-present files are skipped. ~156 MB on first run.
-#[tauri::command]
-pub async fn local_tts_prepare() -> Result<LocalTtsStatus, String> {
-    let dir = model_dir()?;
-    debug_log(&format!("prepare: start dir={}", dir.display()));
-    tokio::fs::create_dir_all(&dir)
+async fn download_into(url: &str, dest: &Path) -> Result<(), String> {
+    let data = http_get_bytes(url).await?;
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    tokio::fs::write(dest, &data)
         .await
-        .map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    let zp = dir.join(ZIPVOICE_DIR);
+        .map_err(|e| format!("write {}: {e}", dest.display()))
+}
 
-    if REQUIRED_ZW_FILES.iter().any(|rel| !zp.join(rel).exists()) {
-        log::info!("local_tts: downloading ZipVoice package…");
-        let data = http_get_bytes(URL_ZIPVOICE).await?;
-        let dest = dir.clone();
+/// Download the tarball (if needed) and the separate vocoder for `model_id`.
+#[tauri::command]
+pub async fn local_tts_prepare(model_id: String) -> Result<ModelInfo, String> {
+    let root = models_root()?;
+    let specs = all_specs(&root);
+    let spec = find_spec(&specs, &model_id)?;
+    debug_log(&format!("prepare: model={} root={}", spec.id, root.display()));
+    tokio::fs::create_dir_all(&root)
+        .await
+        .map_err(|e| format!("mkdir {}: {e}", root.display()))?;
+
+    let dir = model_dir(&root, spec);
+    if !model_ready(&dir, spec) {
+        let url = spec
+            .url
+            .as_ref()
+            .ok_or_else(|| format!("model {} has no download url", spec.id))?;
+        debug_log(&format!("prepare: downloading tarball {url}"));
+        let data = http_get_bytes(url).await?;
+        let dest = root.clone();
         tauri::async_runtime::spawn_blocking(move || extract_tar_bz2(&data, &dest))
             .await
             .map_err(|e| format!("untar task join: {e}"))??;
     }
 
-    if !dir.join("vocos_24khz.onnx").exists() {
-        log::info!("local_tts: downloading vocoder…");
-        let data = http_get_bytes(URL_VOCODER).await?;
-        tokio::fs::write(dir.join("vocos_24khz.onnx"), &data)
-            .await
-            .map_err(|e| format!("write vocoder: {e}"))?;
+    let dir = model_dir(&root, spec);
+    if let (Some(url), Some(name)) = (&spec.vocoder_url, &spec.vocoder) {
+        let dest = dir.join(name);
+        if !dest.exists() {
+            debug_log(&format!("prepare: downloading vocoder {url}"));
+            download_into(url, &dest).await?;
+        }
     }
 
-    if !dir.join("lexicon-en-us.txt").exists() {
-        log::info!("local_tts: downloading en lexicon…");
-        let data = http_get_bytes(URL_LEXICON_EN).await?;
-        tokio::fs::write(dir.join("lexicon-en-us.txt"), &data)
-            .await
-            .map_err(|e| format!("write lexicon: {e}"))?;
-    }
-
-    Ok(status_of(&dir))
+    let info = info_of(&root, spec);
+    debug_log(&format!("prepare: ready={}", info.ready));
+    Ok(info)
 }
 
-fn build_engine(dir: &Path) -> Result<TtsEngine, String> {
-    let zp = dir.join(ZIPVOICE_DIR);
-    let p = |rel: &str| zp.join(rel).to_string_lossy().into_owned();
+fn resolve_model(spec: &ModelSpec, dir: &Path) -> Result<String, String> {
+    if let Some(name) = &spec.model {
+        let candidate = dir.join(name);
+        if is_model_onnx(&candidate) {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
+    }
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    let mut onnx: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| is_model_onnx(p))
+        .filter(|p| {
+            spec.vocoder
+                .as_ref()
+                .is_none_or(|v| p.file_name().and_then(|s| s.to_str()) != Some(v.as_str()))
+        })
+        .collect();
+    onnx.sort();
+    onnx.into_iter()
+        .next()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("no .onnx model file found in {}", dir.display()))
+}
 
-    let config = OfflineTtsConfig {
-        model: OfflineTtsModelConfig {
-            zipvoice: OfflineTtsZipvoiceModelConfig {
-                tokens: Some(p("tokens.txt")),
-                encoder: Some(p("encoder.int8.onnx")),
-                decoder: Some(p("decoder.int8.onnx")),
-                vocoder: Some(dir.join("vocos_24khz.onnx").to_string_lossy().into_owned()),
-                lexicon: Some(format!(
-                    "{},{}",
-                    p("lexicon.txt"),
-                    dir.join("lexicon-en-us.txt").to_string_lossy()
-                )),
+fn build_engine(root: &Path, spec: &ModelSpec) -> Result<TtsEngine, String> {
+    let dir = model_dir(root, spec);
+    let p = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+    let model = resolve_model(spec, &dir)?;
+    let tokens = p(spec.tokens.as_deref().unwrap_or("tokens.txt"));
+    let lexicons: Vec<String> = spec
+        .lexicons
+        .iter()
+        .map(|rel| dir.join(rel))
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let lexicon = if lexicons.is_empty() {
+        None
+    } else {
+        Some(lexicons.join(","))
+    };
+    let num_threads = spec.params.num_threads.unwrap_or(4);
+
+    let mut model_cfg = OfflineTtsModelConfig {
+        num_threads,
+        debug: false,
+        ..Default::default()
+    };
+    match spec.kind {
+        ModelKind::Vits => {
+            model_cfg.vits = OfflineTtsVitsModelConfig {
+                model: Some(model),
+                tokens: Some(tokens),
+                lexicon,
+                noise_scale: spec.params.noise_scale.unwrap_or(0.667),
+                noise_scale_w: spec.params.noise_scale_w.unwrap_or(0.8),
+                length_scale: spec.params.length_scale.unwrap_or(1.0),
+                ..Default::default()
+            };
+        }
+        ModelKind::Matcha => {
+            model_cfg.matcha = OfflineTtsMatchaModelConfig {
+                acoustic_model: Some(model),
+                vocoder: spec.vocoder.as_ref().map(|name| p(name)),
+                lexicon,
+                tokens: Some(tokens),
+                dict_dir: spec.dict_dir.as_ref().map(|rel| p(rel)),
+                noise_scale: spec.params.noise_scale.unwrap_or(0.667),
+                length_scale: spec.params.length_scale.unwrap_or(1.0),
+                ..Default::default()
+            };
+        }
+        ModelKind::Zipvoice => {
+            model_cfg.zipvoice = OfflineTtsZipvoiceModelConfig {
+                tokens: Some(tokens),
+                encoder: Some(p(ZIPVOICE_ENCODER)),
+                decoder: Some(p(ZIPVOICE_DECODER)),
+                vocoder: spec.vocoder.as_ref().map(|name| p(name)),
+                lexicon,
                 feat_scale: 0.1,
                 t_shift: 0.5,
                 target_rms: 0.1,
                 guidance_scale: 1.0,
                 ..Default::default()
-            },
-            num_threads: 2,
-            debug: false,
-            ..Default::default()
+            };
+        }
+    }
+
+    let rule_fsts: Vec<String> = spec
+        .rule_fsts
+        .iter()
+        .map(|rel| dir.join(rel))
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+
+    let config = OfflineTtsConfig {
+        model: model_cfg,
+        rule_fsts: if rule_fsts.is_empty() {
+            None
+        } else {
+            Some(rule_fsts.join(","))
         },
+        // The Rust struct derives Default (0 / 0.0), while the C++ defaults are
+        // 1 / 0.2. Set them explicitly so long text is processed sentence by
+        // sentence and sentences are separated by a short silence.
+        max_num_sentences: 1,
+        silence_scale: 0.2,
         ..Default::default()
     };
 
-    debug_log(&format!("build_engine: creating OfflineTts (dir={})", dir.display()));
+    debug_log(&format!(
+        "build_engine: creating OfflineTts (model={}, kind={:?}, dir={})",
+        spec.id,
+        spec.kind,
+        dir.display()
+    ));
     let tts = match OfflineTts::create(&config) {
         Some(t) => {
-            debug_log("build_engine: OfflineTts created");
+            debug_log(&format!("build_engine: OfflineTts created (sr={})", t.sample_rate()));
             t
         }
         None => {
@@ -245,51 +546,72 @@ fn build_engine(dir: &Path) -> Result<TtsEngine, String> {
         }
     };
 
-    let ref_path = zp.join(REFERENCE_WAV).to_string_lossy().into_owned();
-    let wave =
-        Wave::read(&ref_path).ok_or_else(|| format!("failed to read reference wav: {ref_path}"))?;
-
-    log::info!(
-        "local_tts: engine created, sample_rate={}, reference={} samples",
-        tts.sample_rate(),
-        wave.samples().len()
-    );
+    let reference = if spec.kind == ModelKind::Zipvoice {
+        let path = dir.join(ZIPVOICE_REFERENCE);
+        match Wave::read(&path.to_string_lossy()) {
+            Some(wave) => Some((wave.samples().to_vec(), wave.sample_rate())),
+            None => {
+                debug_log(&format!(
+                    "build_engine: failed to read reference {}",
+                    path.display()
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     Ok(TtsEngine {
+        id: spec.id.clone(),
         tts,
-        reference: wave.samples().to_vec(),
-        reference_rate: wave.sample_rate(),
+        reference,
     })
 }
 
-fn synth_blocking(text: &str, speed: f32) -> Result<Vec<u8>, String> {
-    let dir = model_dir()?;
-    let missing = missing_files(&dir);
-    if !missing.is_empty() {
+fn synth_blocking(model_id: &str, text: &str, speed: f32) -> Result<Vec<u8>, String> {
+    let root = models_root()?;
+    let specs = all_specs(&root);
+    let spec = find_spec(&specs, model_id)?;
+    let dir = model_dir(&root, spec);
+    if !model_ready(&dir, spec) {
         return Err(format!(
-            "local TTS models missing in {} (call local_tts_prepare): {}",
-            dir.to_string_lossy(),
-            missing.join(", ")
+            "model {} is not downloaded in {} (call local_tts_prepare first)",
+            spec.id,
+            dir.display()
         ));
     }
 
     let cell = engine_cell();
     let mut guard = cell.lock().map_err(|e| format!("tts lock poisoned: {e}"))?;
-    if guard.is_none() {
-        *guard = Some(build_engine(&dir)?);
+    let needs_rebuild = match guard.as_ref() {
+        Some(engine) => engine.id != spec.id,
+        None => true,
+    };
+    if needs_rebuild {
+        *guard = Some(build_engine(&root, spec)?);
     }
-    let engine = guard.as_ref().ok_or_else(|| "engine not initialized".to_string())?;
+    let engine = guard
+        .as_ref()
+        .ok_or_else(|| "engine not initialized".to_string())?;
 
-    let gen = GenerationConfig {
+    let mut gen = GenerationConfig {
         speed,
-        reference_audio: Some(engine.reference.clone()),
-        reference_sample_rate: engine.reference_rate,
-        reference_text: Some(REFERENCE_TEXT.to_string()),
-        num_steps: 4,
+        sid: spec.params.sid.unwrap_or(0),
         ..Default::default()
     };
+    if let Some((reference, rate)) = &engine.reference {
+        gen.reference_audio = Some(reference.clone());
+        gen.reference_sample_rate = *rate;
+        gen.reference_text = Some(ZIPVOICE_REFERENCE_TEXT.to_string());
+        gen.num_steps = 4;
+    }
 
-    debug_log(&format!("synth: text_len={} generating…", text.chars().count()));
+    debug_log(&format!(
+        "synth: model={} text_len={} generating…",
+        spec.id,
+        text.chars().count()
+    ));
     let audio = match engine
         .tts
         .generate_with_config(text, &gen, None::<fn(&[f32], f32) -> bool>)
@@ -306,17 +628,22 @@ fn synth_blocking(text: &str, speed: f32) -> Result<Vec<u8>, String> {
     Ok(f32_to_wav(audio.samples(), sr))
 }
 
-/// Synthesize `text` and return a 16-bit mono WAV, base64-encoded for IPC.
+/// Synthesize `text` with `model_id` and return a 16-bit mono WAV, base64-encoded.
 ///
 /// Base64 keeps the payload compact across the Tauri boundary (a raw Vec<u8>
 /// would serialize as a JSON number array). The frontend decodes it back into
 /// an ArrayBuffer for `decodeAudioData`.
 #[tauri::command]
-pub async fn local_tts_synthesize(text: String, speed: Option<f32>) -> Result<String, String> {
+pub async fn local_tts_synthesize(
+    model_id: String,
+    text: String,
+    speed: Option<f32>,
+) -> Result<String, String> {
     let speed = speed.unwrap_or(1.0);
-    let result = tauri::async_runtime::spawn_blocking(move || synth_blocking(&text, speed))
-        .await
-        .map_err(|e| format!("tts task join error: {e}"))?;
+    let result =
+        tauri::async_runtime::spawn_blocking(move || synth_blocking(&model_id, &text, speed))
+            .await
+            .map_err(|e| format!("tts task join error: {e}"))?;
     match result {
         Ok(wav) => Ok(B64.encode(wav)),
         Err(e) => {

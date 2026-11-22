@@ -260,6 +260,7 @@
     "allow-localsend-cancel-receive",
     "allow-localsend-send-files",
     "allow-localsend-cancel-send",
+    "allow-local-tts-list-models",
     "allow-local-tts-status",
     "allow-local-tts-log",
     "allow-local-tts-prepare",

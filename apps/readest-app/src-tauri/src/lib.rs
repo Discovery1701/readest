@@ -688,6 +688,8 @@ pub fn run() {
             localsend::commands::localsend_send_files,
             localsend::commands::localsend_cancel_send,
             #[cfg(desktop)]
+            local_tts::local_tts_list_models,
+            #[cfg(desktop)]
             local_tts::local_tts_status,
             #[cfg(desktop)]
             local_tts::local_tts_log,
