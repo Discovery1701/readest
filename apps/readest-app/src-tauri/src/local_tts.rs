@@ -110,10 +110,16 @@ struct TtsEngine {
     reference: Option<(Vec<f32>, i32)>,
 }
 
-static ENGINE: OnceLock<Mutex<Option<TtsEngine>>> = OnceLock::new();
+/// Small LRU of loaded engines, most-recently-used last. Reloading a 100 MB+
+/// model costs several seconds, and the preload path plus real playback can
+/// race on different model ids - a single slot would thrash and make every
+/// sentence pay the model load again.
+const MAX_ENGINES: usize = 2;
 
-fn engine_cell() -> &'static Mutex<Option<TtsEngine>> {
-    ENGINE.get_or_init(|| Mutex::new(None))
+static ENGINES: OnceLock<Mutex<Vec<TtsEngine>>> = OnceLock::new();
+
+fn engine_cell() -> &'static Mutex<Vec<TtsEngine>> {
+    ENGINES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Directory of the running executable (portable build: where the .exe sits).
@@ -447,7 +453,7 @@ pub async fn local_tts_prepare(model_id: String) -> Result<ModelInfo, String> {
         let _ = tauri::async_runtime::spawn_blocking(move || {
             let already = engine_cell()
                 .lock()
-                .map(|guard| guard.as_ref().is_some_and(|e| e.id == warm_spec.id))
+                .map(|guard| guard.iter().any(|e| e.id == warm_spec.id))
                 .unwrap_or(false);
             if already {
                 return;
@@ -456,7 +462,10 @@ pub async fn local_tts_prepare(model_id: String) -> Result<ModelInfo, String> {
                 Ok(engine) => {
                     debug_log(&format!("prepare: engine warmed ({})", warm_spec.id));
                     if let Ok(mut guard) = engine_cell().lock() {
-                        *guard = Some(engine);
+                        if guard.len() >= MAX_ENGINES {
+                            guard.remove(0);
+                        }
+                        guard.push(engine);
                     }
                 }
                 Err(e) => debug_log(&format!("prepare: warm failed: {e}")),
@@ -634,16 +643,10 @@ fn synth_blocking(model_id: &str, text: &str, speed: f32) -> Result<Vec<u8>, Str
 
     let cell = engine_cell();
     let mut guard = cell.lock().map_err(|e| format!("tts lock poisoned: {e}"))?;
-    let needs_rebuild = match guard.as_ref() {
-        Some(engine) => engine.id != spec.id,
-        None => true,
+    let engine = match guard.iter().position(|e| e.id == spec.id) {
+        Some(idx) => guard.remove(idx),
+        None => build_engine(&root, spec)?,
     };
-    if needs_rebuild {
-        *guard = Some(build_engine(&root, spec)?);
-    }
-    let engine = guard
-        .as_ref()
-        .ok_or_else(|| "engine not initialized".to_string())?;
 
     let mut gen = GenerationConfig {
         speed,
@@ -675,7 +678,14 @@ fn synth_blocking(model_id: &str, text: &str, speed: f32) -> Result<Vec<u8>, Str
     let sr = audio.sample_rate();
     let n = audio.samples().len();
     debug_log(&format!("synth: ok samples={n} rate={sr}"));
-    Ok(f32_to_wav(audio.samples(), sr))
+    let wav = f32_to_wav(audio.samples(), sr);
+    drop(audio);
+    // Put the engine back as most-recently-used, evicting the oldest.
+    if guard.len() >= MAX_ENGINES {
+        guard.remove(0);
+    }
+    guard.push(engine);
+    Ok(wav)
 }
 
 /// Synthesize `text` with `model_id` and return a 16-bit mono WAV, base64-encoded.
