@@ -259,6 +259,10 @@
     "allow-localsend-respond",
     "allow-localsend-cancel-receive",
     "allow-localsend-send-files",
-    "allow-localsend-cancel-send"
+    "allow-localsend-cancel-send",
+    "allow-local-tts-status",
+    "allow-local-tts-log",
+    "allow-local-tts-prepare",
+    "allow-local-tts-synthesize"
   ]
 }
