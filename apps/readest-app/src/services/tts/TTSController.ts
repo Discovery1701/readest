@@ -136,6 +136,8 @@ export class TTSController extends EventTarget {
   #consecutiveSpeakErrors: number = 0;
   #currentSpeakAbortController: AbortController | null = null;
   #currentSpeakPromise: Promise<void> | null = null;
+  #preloadAbortController: AbortController | null = null;
+  #preloadPromise: Promise<void> | null = null;
 
   #ttsSectionIndex: number = -1;
 
@@ -1461,31 +1463,58 @@ export class TTSController extends EventTarget {
   }
 
   async preloadNextSSML(count: number = 4) {
+    // speak()/start()/forward() all call this; stacking batches saturates the
+    // CPU (every batch re-synthesizes several sentences) and starves playback.
+    if (this.#preloadPromise) return;
     const tts = this.#getTts();
     if (!tts) return;
 
-    // Gather all next SSMLs and rewind synchronously to avoid a race condition:
-    // tts.next() replaces TTS.#ranges (used by setMark() during playback).
-    // If async gaps exist between next()/prev() calls, a concurrent #speak()
-    // can dispatch marks against the wrong #ranges, causing incorrect highlights
-    // and accidental page turns.
-    const rawSsmls: string[] = [];
-    for (let i = 0; i < count; i++) {
-      const ssml = tts.next();
-      if (!ssml) break;
-      rawSsmls.push(ssml);
-    }
-    for (let i = 0; i < rawSsmls.length; i++) {
-      tts.prev();
-    }
+    const controller = new AbortController();
+    this.#preloadAbortController = controller;
+    const { signal } = controller;
 
-    const ssmls: string[] = [];
-    for (const raw of rawSsmls) {
-      const ssml = await this.#preprocessSSML(raw);
-      if (!ssml) break;
-      ssmls.push(ssml);
-    }
-    await Promise.all(ssmls.map((ssml) => this.preloadSSML(ssml, new AbortController().signal)));
+    const run = (async () => {
+      // Gather all next SSMLs and rewind synchronously to avoid a race condition:
+      // tts.next() replaces TTS.#ranges (used by setMark() during playback).
+      // If async gaps exist between next()/prev() calls, a concurrent #speak()
+      // can dispatch marks against the wrong #ranges, causing incorrect highlights
+      // and accidental page turns.
+      const rawSsmls: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const ssml = tts.next();
+        if (!ssml) break;
+        rawSsmls.push(ssml);
+      }
+      for (let i = 0; i < rawSsmls.length; i++) {
+        tts.prev();
+      }
+
+      const ssmls: string[] = [];
+      for (const raw of rawSsmls) {
+        if (signal.aborted) return;
+        const ssml = await this.#preprocessSSML(raw);
+        if (!ssml) break;
+        ssmls.push(ssml);
+      }
+      // Aborts are expected on stop/voice switch; swallow them so they don't
+      // surface as unhandled rejections.
+      await Promise.all(ssmls.map((ssml) => this.preloadSSML(ssml, signal).catch(() => {})));
+    })();
+
+    const tracked = run.finally(() => {
+      if (this.#preloadAbortController === controller) {
+        this.#preloadAbortController = null;
+        this.#preloadPromise = null;
+      }
+    });
+    this.#preloadPromise = tracked;
+    await tracked;
+  }
+
+  #cancelPreload() {
+    this.#preloadAbortController?.abort();
+    this.#preloadAbortController = null;
+    this.#preloadPromise = null;
   }
 
   async #preprocessSSML(ssml?: string) {
@@ -1708,6 +1737,7 @@ export class TTSController extends EventTarget {
   }
 
   async stop(handover = false) {
+    this.#cancelPreload();
     this.#awaitingAudio = false;
     if (this.#currentSpeakAbortController) {
       this.#currentSpeakAbortController.abort();
@@ -1839,6 +1869,7 @@ export class TTSController extends EventTarget {
   }
 
   async setVoice(voiceId: string, lang: string) {
+    this.#cancelPreload();
     this.state = 'setvoice-paused';
 
     // Switching into or out of narration changes the mark source, not just the
