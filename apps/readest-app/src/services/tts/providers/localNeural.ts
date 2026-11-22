@@ -51,18 +51,12 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
 
   async init(): Promise<boolean> {
     if (!isTauriAppPlatform()) return false;
-    try {
-      const status = await invoke<LocalTtsPrepareResult>('local_tts_status');
-      if (!status?.ready) {
-        // Do NOT await prepare here: TTSController.init() is awaited on startup,
-        // so downloading models would stall TTS init into a permanent spinner.
-        void this.#ensurePrepared();
-      }
-      return true;
-    } catch (err) {
-      console.warn('[TTS] local_tts_status failed', err);
-      return false;
-    }
+    // Availability is Tauri-based only. Do NOT gate it on the status probe:
+    // any transient invoke failure would flip initialized=false and grey the
+    // whole voice group out even though the engine works. Preparation is lazy
+    // and skips straight through when the model files are already present.
+    void this.#ensurePrepared();
+    return true;
   }
 
   async getAllVoices(): Promise<TTSVoice[]> {
