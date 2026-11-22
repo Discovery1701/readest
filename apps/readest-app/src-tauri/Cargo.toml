@@ -224,7 +224,9 @@ tauri-plugin-cli = "2"
 # Local neural TTS (ZipVoice) via sherpa-onnx, desktop only. The default `static`
 # feature links a prebuilt onnxruntime that build.rs downloads once on Windows
 # MSVC. Used only by the self-hosted "local TTS" engine in src/local_tts.rs.
-sherpa-onnx = "2.0.2"
+# Pinned exactly: 2.0.3 ships no Windows prebuilt archive yet, so letting
+# cargo pick the latest patch makes sherpa-onnx-sys fail with a 404.
+sherpa-onnx = "=2.0.2"
 # Runtime model auto-download: fetch the ZipVoice tarball and unpack in-process
 # into <exe_dir>/models/zipvoice/. Desktop only.
 bzip2 = "0.4"
