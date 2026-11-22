@@ -79,7 +79,7 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
    * synthesizes upcoming sentences to preload them and then synthesizes the
    * same text again for playback; without this the reader waits twice.
    */
-  #audioCache = new Map<string, Uint8Array>();
+  #audioCache = new Map<string, string>();
 
   async init(): Promise<boolean> {
     logToBackend(`init: isTauri=${isTauriAppPlatform()}`);
@@ -119,8 +119,7 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
     const cacheKey = `${modelId}\u0000${req.pitch}\u0000${req.text}`;
     const cached = this.#audioCache.get(cacheKey);
     if (cached) {
-      // decodeAudioData() detaches the buffer it is handed, so return a copy.
-      return { audio: cached.slice().buffer as ArrayBuffer, boundaries: [] };
+      return { audio: decodeBase64Wav(cached), boundaries: [] };
     }
     logToBackend(`synth: model=${modelId} len=${req.text.length}`);
     const ready = await abortable(this.#ensurePrepared(modelId), signal);
@@ -150,11 +149,10 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
       const oldest = this.#audioCache.keys().next().value;
       if (oldest !== undefined) this.#audioCache.delete(oldest);
     }
-    // Store an independent copy: decodeAudioData() detaches the buffer we
-    // return, so a view sharing that buffer would become out of bounds.
-    const stored = new Uint8Array(audio.byteLength);
-    stored.set(new Uint8Array(audio));
-    this.#audioCache.set(cacheKey, stored);
+    // Cache the base64 payload rather than decoded bytes: decodeAudioData()
+    // detaches whatever buffer it is handed, so a byte cache would go stale
+    // after the first play. Re-decoding costs ~10ms per sentence.
+    this.#audioCache.set(cacheKey, base64);
 
     return { audio, boundaries: [] };
   }

@@ -178,6 +178,11 @@ export class TTSController extends EventTarget {
 
   #state: TTSState = 'stopped';
   #terminated = false;
+  // Irreversible: set synchronously by shutdown(). A controller stopped while
+  // its async start-up is still in flight must never speak again — otherwise it
+  // creates a player nobody owns, and two players on the shared AudioContext
+  // play over each other.
+  #disposed = false;
   // View attachment: false while the session runs headless (book closed).
   // The epoch invalidates in-flight attachView calls when a detach (or a
   // newer attach) supersedes them.
@@ -405,9 +410,12 @@ export class TTSController extends EventTarget {
   }
 
   async init() {
+    if (this.#disposed) return;
     const availableClients = [];
     if (isTauriAppPlatform() && !this.ttsLocalClient) {
       const { LocalNeuralTTSClient } = await import('./LocalNeuralTTSClient');
+      // The controller may have been shut down while the chunk loaded.
+      if (this.#disposed) return;
       this.ttsLocalClient = new LocalNeuralTTSClient(this, this.appService);
     }
     if (await this.ttsEdgeClient.init()) {
@@ -686,6 +694,7 @@ export class TTSController extends EventTarget {
   }
 
   async initViewTTS(index?: number) {
+    if (this.#disposed) return;
     if (this.#ttsSectionIndex === -1) {
       const fromSectionIndex = (index || this.#getPrimaryContent()?.index) ?? 0;
       await this.#initTTSForSection(fromSectionIndex);
@@ -1544,10 +1553,14 @@ export class TTSController extends EventTarget {
   }
 
   async #speak(ssml: string | undefined | Promise<string>, oneTime = false) {
+    if (this.#disposed) return;
     // A handover, not a stop: this clears the previous utterance so the next one
     // can start. Recorded narration stays rolling through it, because the next
     // utterance is the same recording playing on.
     await this.stop(true);
+    // shutdown() may have landed while stop(true) was awaiting: this is the only
+    // path that produces audio, so it is the last gate before creating a player.
+    if (this.#disposed) return;
     this.#terminated = false;
     this.#currentSpeakAbortController = new AbortController();
     const { signal } = this.#currentSpeakAbortController;
@@ -1685,6 +1698,7 @@ export class TTSController extends EventTarget {
   }
 
   async speak(ssml: string | Promise<string>, oneTime = false, oneTimeCallback?: () => void) {
+    if (this.#disposed) return;
     await this.initViewTTS();
     this.#speak(ssml, oneTime)
       .then(() => {
@@ -1708,6 +1722,7 @@ export class TTSController extends EventTarget {
   }
 
   async start() {
+    if (this.#disposed) return;
     await this.initViewTTS();
     // Always resume from the current list position instead of calling tts.start().
     // tts.start() resets the TTS list to position 0 (section beginning), which is
@@ -1732,6 +1747,7 @@ export class TTSController extends EventTarget {
   }
 
   async resume() {
+    if (this.#disposed) return;
     this.state = 'playing';
     await this.ttsClient.resume().catch((e) => this.error(e));
   }
@@ -2233,6 +2249,13 @@ export class TTSController extends EventTarget {
   }
 
   async shutdown() {
+    if (this.#disposed) return;
+    // Set first, synchronously: a start()/init()/speak() continuation that
+    // resumes after this point must bail out rather than create a player nobody
+    // owns (two players on the shared AudioContext = overlapping audio).
+    this.#disposed = true;
+    this.#currentSpeakAbortController?.abort();
+    this.#cancelPreload();
     stopAudioKeepAlive();
     await this.stop();
     this.#clearAllHighlights();
@@ -2241,16 +2264,20 @@ export class TTSController extends EventTarget {
     this.#timelineSectionIndex = -1;
     this.#currentSentenceIndex = -1;
     this.#ttsDoc = null;
+    const ownTts = this.#tts;
     this.#tts = null;
     this.#mediaOverlaySection = null;
-    this.view.tts = null;
+    // A newer controller may already own view.tts; only clear our own mirror.
+    if (this.view.tts === ownTts) this.view.tts = null;
     if (this.ttsWebClient.initialized) {
       await this.ttsWebClient.shutdown();
     }
     if (this.ttsEdgeClient.initialized) {
       await this.ttsEdgeClient.shutdown();
     }
-    if (this.ttsLocalClient?.initialized) {
+    // Unconditional: the client (and its player) exists from construction, so an
+    // unfinished init() still owns a player that must be stopped.
+    if (this.ttsLocalClient) {
       await this.ttsLocalClient.shutdown();
     }
     if (this.ttsNativeClient?.initialized) {

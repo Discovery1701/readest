@@ -989,7 +989,15 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         // own narration or a synthesized voice.
         ttsController.useNarration = viewSettings.ttsUseNarration ?? true;
         await ttsController.init();
+        if (ttsControllerRef.current !== ttsController) {
+          void ttsController.shutdown();
+          return;
+        }
         await ttsController.initViewTTS(ttsFromIndex);
+        if (ttsControllerRef.current !== ttsController) {
+          void ttsController.shutdown();
+          return;
+        }
         ttsController.updateHighlightOptions(
           getTTSHighlightOptions(
             viewSettings.ttsHighlightOptions,
