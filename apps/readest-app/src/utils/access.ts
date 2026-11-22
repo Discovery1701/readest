@@ -94,7 +94,7 @@ export const isTTSCacheInPlan = (plan: UserPlan, customizationPurchased: boolean
  * automatic playback cache (audio kept as the user listens) is unaffected —
  * only the explicit download UI is gated.
  */
-export const TTS_CACHE_REQUIRES_PREMIUM = true;
+export const TTS_CACHE_REQUIRES_PREMIUM = false;
 
 export const isTTSCacheAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
   !TTS_CACHE_REQUIRES_PREMIUM || isTTSCacheInPlan(plan, customizationPurchased);
