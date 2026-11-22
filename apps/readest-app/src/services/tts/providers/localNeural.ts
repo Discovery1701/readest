@@ -16,6 +16,10 @@ interface LocalTtsPrepareResult {
   missing?: string[];
 }
 
+const logToBackend = (msg: string) => {
+  void invoke('local_tts_log', { msg }).catch(() => {});
+};
+
 // Backend returns base64 of a 16-bit mono 24kHz WAV. Tolerate a data: prefix.
 const decodeBase64Wav = (base64: string): ArrayBuffer => {
   const comma = base64.indexOf(',');
@@ -50,6 +54,7 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
   #prepare: Promise<boolean> | null = null;
 
   async init(): Promise<boolean> {
+    logToBackend(`init: isTauri=${isTauriAppPlatform()}`);
     if (!isTauriAppPlatform()) return false;
     // Availability is Tauri-based only. Do NOT gate it on the status probe:
     // any transient invoke failure would flip initialized=false and grey the
@@ -73,7 +78,9 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
     req: SpeechSynthesisRequest,
     signal: AbortSignal,
   ): Promise<SpeechSynthesisResult> {
+    logToBackend(`synth: start len=${req.text.length}`);
     const ready = await abortable(this.#ensurePrepared(), signal);
+    logToBackend(`synth: prepared=${ready}`);
     if (!ready) {
       throw new Error('Local TTS model is not ready');
     }
@@ -87,6 +94,7 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
       }),
       signal,
     );
+    logToBackend(`synth: base64 len=${base64?.length ?? 0}`);
 
     const audio = decodeBase64Wav(base64);
     if (audio.byteLength === 0) {
@@ -98,14 +106,18 @@ export class LocalNeuralSpeechProvider implements SpeechProvider {
 
   #ensurePrepared(): Promise<boolean> {
     if (!this.#prepare) {
+      logToBackend('prepare: invoking local_tts_prepare');
       this.#prepare = invoke<LocalTtsPrepareResult>('local_tts_prepare')
         .then((result) => {
           const ready = !!result?.ready;
+          logToBackend(
+            `prepare: ready=${ready} missing=${JSON.stringify(result?.missing ?? [])} dir=${result?.model_dir ?? ''}`,
+          );
           if (!ready) this.#prepare = null; // allow a later retry
           return ready;
         })
         .catch((err) => {
-          console.warn('[TTS] local_tts_prepare failed', err);
+          logToBackend(`prepare: error ${String(err)}`);
           this.#prepare = null;
           return false;
         });

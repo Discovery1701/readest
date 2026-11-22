@@ -135,6 +135,12 @@ pub fn local_tts_status() -> LocalTtsStatus {
     }
 }
 
+/// Frontend-side tracing helper (writes into the same `<exe>/tts-debug.log`).
+#[tauri::command]
+pub fn local_tts_log(msg: String) {
+    debug_log(&format!("[frontend] {msg}"));
+}
+
 async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     let resp = reqwest::get(url)
         .await
@@ -164,6 +170,7 @@ fn extract_tar_bz2(data: &[u8], dest: &Path) -> Result<(), String> {
 #[tauri::command]
 pub async fn local_tts_prepare() -> Result<LocalTtsStatus, String> {
     let dir = model_dir()?;
+    debug_log(&format!("prepare: start dir={}", dir.display()));
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
