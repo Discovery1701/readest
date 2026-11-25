@@ -269,24 +269,45 @@ fn builtin_models() -> Vec<ModelSpec> {
     list
 }
 
-fn load_catalog(root: &Path) -> Vec<ModelSpec> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CatalogFile {
+    List(Vec<ModelSpec>),
+    Object {
+        models: Vec<ModelSpec>,
+        #[serde(default)]
+        replace: bool,
+    },
+}
+
+/// Parse `<exe>/models/catalog.json`. Two shapes are accepted: a bare array
+/// (merge/override the built-in list) or `{ "replace": true, "models": [...] }`
+/// to hide the built-ins and expose only the listed models.
+fn load_catalog(root: &Path) -> (Vec<ModelSpec>, bool) {
     let path = root.join(CATALOG_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
-    match serde_json::from_str::<Vec<ModelSpec>>(&text) {
-        Ok(entries) => entries,
+    match serde_json::from_str::<CatalogFile>(&text) {
+        Ok(CatalogFile::List(entries)) => (entries, false),
+        Ok(CatalogFile::Object { models, replace }) => (models, replace),
         Err(e) => {
             debug_log(&format!("catalog: parse {} failed: {e}", path.display()));
-            Vec::new()
+            (Vec::new(), false)
         }
     }
 }
 
 /// Built-in models with `catalog.json` entries merged in (same id replaces).
+/// A catalog with `"replace": true` drops the built-ins entirely.
 fn all_specs(root: &Path) -> Vec<ModelSpec> {
-    let mut specs = builtin_models();
-    for extra in load_catalog(root) {
+    let (entries, replace) = load_catalog(root);
+    let mut specs = if replace {
+        Vec::new()
+    } else {
+        builtin_models()
+    };
+    for extra in entries {
         if let Some(pos) = specs.iter().position(|s| s.id == extra.id) {
             specs[pos] = extra;
         } else {
