@@ -67,12 +67,14 @@ jobs:
 
       - name: reset sherpa-onnx build output
         shell: bash
-        # rust-cache restores target/, but the extracted sherpa-onnx native
-        # libs can be dropped from the cache. The fingerprint then still marks
-        # the build script as fresh, so linking fails with "could not find
-        # native static library sherpa-onnx-c-api". Removing both forces the
-        # build script to re-download and re-extract.
+        # rust-cache restores target/, but its copy of the extracted sherpa-onnx
+        # native libs can be incomplete. sherpa-onnx-sys' build.rs short-circuits
+        # when target/sherpa-onnx-prebuilt/<archive>/lib exists, so a half-restored
+        # tree makes linking fail with "could not find native static library
+        # sherpa-onnx-c-api". Drop the extracted tree plus the build script
+        # fingerprints so it re-downloads and re-extracts.
         run: |
+          rm -rf target/sherpa-onnx-prebuilt target/*/sherpa-onnx-prebuilt
           find target -maxdepth 4 \( -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys*' \) -exec rm -rf {} + 2>/dev/null || true
 
       - name: build Windows bundle
