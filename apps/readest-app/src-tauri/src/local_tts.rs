@@ -136,9 +136,29 @@ fn models_root() -> Result<PathBuf, String> {
     Ok(exe_dir()?.join(MODELS_SUBDIR))
 }
 
-/// Append a line to `<exe_dir>/tts-debug.log` so field issues are diagnosable
-/// without devtools. Best-effort: logging failures are ignored.
+/// Debug logging is opt-in. Enable it either by setting `READEST_TTS_DEBUG=1`
+/// or by creating an empty `<exe>/models/tts-debug.on` file (delete the file
+/// to turn it off again). Checked on every call, so the switch can be flipped
+/// without restarting the app - one `exists()` per log line is negligible.
+fn debug_enabled() -> bool {
+    if matches!(
+        std::env::var("READEST_TTS_DEBUG").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    ) {
+        return true;
+    }
+    models_root()
+        .map(|root| root.join("tts-debug.on").exists())
+        .unwrap_or(false)
+}
+
+/// Append a line to `<exe_dir>/tts-debug.log` when debug logging is enabled,
+/// so field issues are diagnosable without devtools. Best-effort: logging
+/// failures are ignored.
 fn debug_log(msg: &str) {
+    if !debug_enabled() {
+        return;
+    }
     use std::io::Write;
     if let Ok(dir) = exe_dir() {
         let path = dir.join("tts-debug.log");
