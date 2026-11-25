@@ -65,6 +65,16 @@ jobs:
           echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> apps/readest-app/.env.local
           echo "NEXT_PUBLIC_PORTABLE_APP=true" >> apps/readest-app/.env.local
 
+      - name: reset sherpa-onnx build output
+        shell: bash
+        # rust-cache restores target/, but the extracted sherpa-onnx native
+        # libs can be dropped from the cache. The fingerprint then still marks
+        # the build script as fresh, so linking fails with "could not find
+        # native static library sherpa-onnx-c-api". Removing both forces the
+        # build script to re-download and re-extract.
+        run: |
+          find target -maxdepth 4 \( -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys*' \) -exec rm -rf {} + 2>/dev/null || true
+
       - name: build Windows bundle
         shell: bash
         env:
